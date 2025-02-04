@@ -1,4 +1,4 @@
-﻿use std::path::{Path, PathBuf};
+﻿use std::path::{PathBuf};
 use std::process::{Command, Stdio};
 use std::io::{BufReader, BufRead};
 use std::sync::mpsc::{self, Receiver};
@@ -21,26 +21,6 @@ pub enum ProgressUpdate {
     Stage(String),
     /// The process is finished with a final message.
     Finished(String),
-}
-
-fn run_command_in_dir(working_dir: &Path, program: &str, args: &[&str]) {
-    println!("Executing: {} {:?}", program, args);
-    if cfg!(target_os = "windows") {
-        Command::new("cmd")
-            .args(&["/C", program])
-            .args(args)
-            .current_dir(working_dir)
-            .spawn()
-            .expect("Failed to execute command");
-    } else {
-        Command::new("sh")
-            .arg("-c")
-            .arg(program)
-            .args(args)
-            .current_dir(working_dir)
-            .spawn()
-            .expect("Failed to execute command");
-    }
 }
 
 /// Launches the build process and returns a receiver for progress updates.
