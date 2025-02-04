@@ -1,15 +1,20 @@
 ﻿use eframe::egui;
 use rfd::FileDialog;
+use std::sync::mpsc::Receiver;
 
 use crate::storage;
 use crate::commands::{create_build_command, create_package_command};
 
+/// Main application state.
 pub struct BuildApp {
     projects: Vec<storage::Project>,
     selected_mode: BuildMode,
     engine_location: Option<storage::Engine>,
     selected_project: Option<usize>,
     selected_platform: Platform,
+    build_progress: Option<f32>,       // Progress value (0.0 to 1.0)
+    progress_message: String,          // Status message to display
+    progress_rx: Option<Receiver<f32>>, // Channel receiver for progress updates
 }
 
 #[derive(PartialEq)]
@@ -45,14 +50,25 @@ impl Default for BuildApp {
             engine_location,
             selected_project: None,
             selected_platform: Platform::Win64,
+            build_progress: None,
+            progress_message: "Idle".to_owned(),
+            progress_rx: None,
         }
     }
 }
 
 impl eframe::App for BuildApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Poll for progress updates from the running build/package process.
+        if let Some(rx) = &self.progress_rx {
+            while let Ok(new_progress) = rx.try_recv() {
+                self.build_progress = Some(new_progress);
+                self.progress_message = format!("{:.0}% complete", new_progress * 100.0);
+            }
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| {
-            // Open Engine button at the top
+            // --- Engine Selection ---
             ui.horizontal(|ui| {
                 if ui.button("Open Engine").clicked() {
                     if let Some(file) = FileDialog::new()
@@ -72,15 +88,14 @@ impl eframe::App for BuildApp {
                         }
                     }
                 }
-
                 if let Some(engine) = &self.engine_location {
                     ui.label(engine.location.to_string_lossy());
                 }
             });
 
-            ui.separator(); // Separator between engine and projects
+            ui.separator();
 
-            // Project radio buttons
+            // --- Project Selection ---
             ui.horizontal_wrapped(|ui| {
                 if ui.button("Open Project").clicked() {
                     if let Some(file) = FileDialog::new()
@@ -103,7 +118,6 @@ impl eframe::App for BuildApp {
                         }
                     }
                 }
-
                 for (index, project) in self.projects.iter().enumerate() {
                     let project_info = format!(
                         "{} (Engine: {}, Plugins: {})",
@@ -115,18 +129,18 @@ impl eframe::App for BuildApp {
                 }
             });
 
-            ui.separator(); // Separator between projects and build modes
+            ui.separator();
 
-            // Radio buttons for build modes
+            // --- Build Mode Selection ---
             ui.horizontal(|ui| {
                 ui.radio_value(&mut self.selected_mode, BuildMode::Debug, "Debug");
                 ui.radio_value(&mut self.selected_mode, BuildMode::Development, "Development");
                 ui.radio_value(&mut self.selected_mode, BuildMode::Shipping, "Shipping");
             });
 
-            ui.separator(); // Separator between build modes and platforms
+            ui.separator();
 
-            // Radio buttons for platforms
+            // --- Platform Selection ---
             ui.horizontal_wrapped(|ui| {
                 ui.radio_value(&mut self.selected_platform, Platform::Win64, "Win64");
                 ui.radio_value(&mut self.selected_platform, Platform::Linux, "Linux");
@@ -140,10 +154,14 @@ impl eframe::App for BuildApp {
                 ui.radio_value(&mut self.selected_platform, Platform::Switch, "Switch");
             });
 
-            // Build and Package buttons at the bottom
+            // Determine if a build/package is running.
+            let running = self.build_progress.is_some();
+
+            // --- Build & Package Buttons and Progress Display ---
             ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
                 ui.horizontal(|ui| {
-                    if ui.button("Build").clicked() {
+                    // Build Button: disabled if a process is running.
+                    if ui.add_enabled(!running, egui::Button::new("Build")).clicked() {
                         if let Some(engine) = &self.engine_location {
                             if let Some(selected_project_index) = self.selected_project {
                                 let project = &self.projects[selected_project_index];
@@ -164,7 +182,18 @@ impl eframe::App for BuildApp {
                                     BuildMode::Development => "Development",
                                     BuildMode::Shipping => "Shipping",
                                 };
-                                create_build_command(&engine.location, &project.name, platform, optimization_type, &project.location);
+
+                                // Launch build process and store its progress receiver.
+                                let rx = create_build_command(
+                                    &engine.location,
+                                    &project.name,
+                                    platform,
+                                    optimization_type,
+                                    &project.location,
+                                );
+                                self.progress_rx = Some(rx);
+                                self.build_progress = Some(0.0);
+                                self.progress_message = "Build started...".to_owned();
                             } else {
                                 eprintln!("No project selected");
                             }
@@ -173,14 +202,14 @@ impl eframe::App for BuildApp {
                         }
                     }
 
-                    let package_button = ui.add_enabled(
-                        self.selected_project
-                            .map(|index| self.projects[index].engine_version == "From Source")
-                            .unwrap_or(false),
-                        egui::Button::new("Package"),
-                    );
-
-                    if package_button.clicked() {
+                    // Package Button: disabled if a process is running.
+                    let package_condition = self.selected_project
+                        .map(|index| self.projects[index].engine_version == "From Source")
+                        .unwrap_or(false);
+                    if ui
+                        .add_enabled(!running && package_condition, egui::Button::new("Package"))
+                        .clicked()
+                    {
                         if let Some(engine) = &self.engine_location {
                             if let Some(selected_project_index) = self.selected_project {
                                 let project = &self.projects[selected_project_index];
@@ -201,7 +230,16 @@ impl eframe::App for BuildApp {
                                     BuildMode::Development => "Development",
                                     BuildMode::Shipping => "Shipping",
                                 };
-                                create_package_command(&engine.location, platform, optimization_type, &project.location);
+                                // Launch package process and store its progress receiver.
+                                let rx = create_package_command(
+                                    &engine.location,
+                                    platform,
+                                    optimization_type,
+                                    &project.location,
+                                );
+                                self.progress_rx = Some(rx);
+                                self.build_progress = Some(0.0);
+                                self.progress_message = "Packaging started...".to_owned();
                             } else {
                                 eprintln!("No project selected");
                             }
@@ -210,6 +248,12 @@ impl eframe::App for BuildApp {
                         }
                     }
                 });
+                // Display the progress bar or status label.
+                if let Some(progress) = self.build_progress {
+                    ui.add(egui::ProgressBar::new(progress).text(&self.progress_message));
+                } else {
+                    ui.label(&self.progress_message);
+                }
             });
         });
     }

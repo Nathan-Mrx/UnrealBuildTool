@@ -1,5 +1,8 @@
 ﻿use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::io::{BufReader, BufRead};
+use std::sync::mpsc::{self, Receiver};
+use regex::Regex;
 
 #[cfg(target_os = "windows")]
 const BUILD_SCRIPT: &str = "Build.bat";
@@ -10,11 +13,10 @@ const BUILD_SCRIPT: &str = "Mac/Build.sh";
 #[cfg(target_os = "macos")]
 const UAT_SCRIPT: &str = "RunUAT.sh";
 
-/// Runs a command with the given program and arguments in the specified working directory.
+/// Executes a command in the specified working directory.
 fn run_command_in_dir(working_dir: &Path, program: &str, args: &[&str]) {
     println!("Executing: {} {:?}", program, args);
     if cfg!(target_os = "windows") {
-        // For Windows, we use cmd /C so that the command is run in a shell.
         Command::new("cmd")
             .args(&["/C", program])
             .args(args)
@@ -22,7 +24,6 @@ fn run_command_in_dir(working_dir: &Path, program: &str, args: &[&str]) {
             .spawn()
             .expect("Failed to execute command");
     } else {
-        // For Unix-like systems, we use sh -c.
         Command::new("sh")
             .arg("-c")
             .arg(program)
@@ -33,23 +34,20 @@ fn run_command_in_dir(working_dir: &Path, program: &str, args: &[&str]) {
     }
 }
 
+/// Launches the build process and returns a receiver for progress updates.
+/// Progress is parsed from output lines matching the pattern "[current/total]".
 pub fn create_build_command(
     engine_location: &PathBuf,
     project_name: &str,
     platform: &str,
     optimization_type: &str,
     uproject_location: &PathBuf,
-) {
-    let engine_path = engine_location
-        .parent()
-        .unwrap()
-        .to_string_lossy()
-        .to_string();
+) -> Receiver<f32> {
+    let (tx, rx) = mpsc::channel::<f32>();
 
-    // Full path to the build batch file.
+    let engine_path = engine_location.parent().unwrap().to_string_lossy();
     let build_bat = format!("{}\\Engine\\Build\\BatchFiles\\{}", engine_path, BUILD_SCRIPT);
 
-    // Build the list of arguments.
     let args = [
         project_name,
         platform,
@@ -58,35 +56,64 @@ pub fn create_build_command(
         "-waitmutex",
     ];
 
+    let working_dir = uproject_location.parent().unwrap();
+
     println!("Build command: {} {:?}", build_bat, args);
 
-    // Use the directory containing the .uproject as the working directory.
-    let working_dir = uproject_location.parent().unwrap();
-    run_command_in_dir(working_dir, &build_bat, &args);
+    let mut child = Command::new("cmd")
+        .args(&["/C", &build_bat])
+        .args(&args)
+        .current_dir(working_dir)
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("Failed to execute build command");
+
+    let stdout = child.stdout.take().expect("Failed to capture stdout");
+
+    // Regex to match lines like "[1/2743]".
+    let progress_regex = Regex::new(r"\[([0-9]+)/([0-9]+)\]").unwrap();
+
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        for line_result in reader.lines() {
+            if let Ok(line) = line_result {
+                println!("Build output: {}", line);
+                if let Some(caps) = progress_regex.captures(&line) {
+                    if let (Some(curr_match), Some(total_match)) = (caps.get(1), caps.get(2)) {
+                        if let (Ok(current), Ok(total)) =
+                            (curr_match.as_str().parse::<f32>(), total_match.as_str().parse::<f32>())
+                        {
+                            if total > 0.0 {
+                                let progress = current / total;
+                                let _ = tx.send(progress);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    rx
 }
 
+/// Launches the package process and returns a receiver for progress updates.
+/// Progress is parsed from output lines matching the pattern "[current/total]".
 pub fn create_package_command(
     engine_location: &PathBuf,
     platform: &str,
     optimization_type: &str,
     uproject_location: &PathBuf,
-) {
-    let engine_path = engine_location
-        .parent()
-        .unwrap()
-        .to_string_lossy()
-        .to_string();
+) -> Receiver<f32> {
+    let (tx, rx) = mpsc::channel::<f32>();
 
-    // Full path to the UAT (Unreal Automation Tool) script.
+    let engine_path = engine_location.parent().unwrap().to_string_lossy().to_string();
     let uat_bat = format!("{}\\Engine\\Build\\BatchFiles\\{}", engine_path, UAT_SCRIPT);
-
-    // Prepare the staging directory argument.
     let staging_directory = format!(
         "{}\\Builds",
         uproject_location.parent().unwrap().to_string_lossy()
     );
 
-    // Build the list of arguments.
     let args = [
         "BuildCookRun",
         &format!("-project={}", uproject_location.to_string_lossy()),
@@ -107,7 +134,41 @@ pub fn create_package_command(
 
     println!("Package command: {} {:?}", uat_bat, args);
 
-    // Use the directory containing the .uproject as the working directory.
     let working_dir = uproject_location.parent().unwrap();
-    run_command_in_dir(working_dir, &uat_bat, &args);
+
+    let mut child = Command::new("cmd")
+        .args(&["/C", &uat_bat])
+        .args(&args)
+        .current_dir(working_dir)
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("Failed to execute package command");
+
+    let stdout = child.stdout.take().expect("Failed to capture stdout");
+
+    // Regex to match lines like "[1/2743]".
+    let progress_regex = Regex::new(r"\[([0-9]+)/([0-9]+)\]").unwrap();
+
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        for line_result in reader.lines() {
+            if let Ok(line) = line_result {
+                println!("Package output: {}", line);
+                if let Some(caps) = progress_regex.captures(&line) {
+                    if let (Some(curr_match), Some(total_match)) = (caps.get(1), caps.get(2)) {
+                        if let (Ok(current), Ok(total)) =
+                            (curr_match.as_str().parse::<f32>(), total_match.as_str().parse::<f32>())
+                        {
+                            if total > 0.0 {
+                                let progress = current / total;
+                                let _ = tx.send(progress);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    rx
 }
