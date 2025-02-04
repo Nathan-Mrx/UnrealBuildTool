@@ -3,7 +3,7 @@ use rfd::FileDialog;
 use std::sync::mpsc::Receiver;
 
 use crate::storage;
-use crate::commands::{create_build_command, create_package_command};
+use crate::commands::{create_build_command, create_package_command, ProgressUpdate};
 
 /// Main application state.
 pub struct BuildApp {
@@ -14,7 +14,7 @@ pub struct BuildApp {
     selected_platform: Platform,
     build_progress: Option<f32>,       // Progress value (0.0 to 1.0)
     progress_message: String,          // Status message to display
-    progress_rx: Option<Receiver<f32>>, // Channel receiver for progress updates
+    progress_rx: Option<Receiver<ProgressUpdate>>, // Receiver for progress updates
 }
 
 #[derive(PartialEq)]
@@ -59,16 +59,39 @@ impl Default for BuildApp {
 
 impl eframe::App for BuildApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Poll for progress updates from the running build/package process.
-        if let Some(rx) = &self.progress_rx {
-            while let Ok(new_progress) = rx.try_recv() {
-                self.build_progress = Some(new_progress);
-                self.progress_message = format!("{:.0}% complete", new_progress * 100.0);
+        // Poll for progress updates from the running process.
+        {
+            if let Some(rx) = self.progress_rx.as_mut() {
+                let mut finished = false;
+                while let Ok(update) = rx.try_recv() {
+                    match update {
+                        ProgressUpdate::Progress(p) => {
+                            self.build_progress = Some(p);
+                            if (p - 1.0).abs() < 0.001 {
+                                self.progress_message = "finalizing...".to_owned();
+                            } else {
+                                self.progress_message = format!("{:.0}% complete", p * 100.0);
+                            }
+                        }
+                        ProgressUpdate::Stage(msg) => {
+                            self.progress_message = msg;
+                        }
+                        ProgressUpdate::Finished(msg) => {
+                            self.build_progress = None;
+                            self.progress_message = msg;
+                            finished = true;
+                        }
+                    }
+                }
+                if finished {
+                    self.progress_rx = None;
+                }
             }
         }
 
+        // The upper part of the UI: Engine, Project, Build Mode, and Platform selections.
         egui::CentralPanel::default().show(ctx, |ui| {
-            // --- Engine Selection ---
+            // Engine Selection
             ui.horizontal(|ui| {
                 if ui.button("Open Engine").clicked() {
                     if let Some(file) = FileDialog::new()
@@ -92,10 +115,9 @@ impl eframe::App for BuildApp {
                     ui.label(engine.location.to_string_lossy());
                 }
             });
-
             ui.separator();
 
-            // --- Project Selection ---
+            // Project Selection
             ui.horizontal_wrapped(|ui| {
                 if ui.button("Open Project").clicked() {
                     if let Some(file) = FileDialog::new()
@@ -128,19 +150,17 @@ impl eframe::App for BuildApp {
                     ui.radio_value(&mut self.selected_project, Some(index), project_info);
                 }
             });
-
             ui.separator();
 
-            // --- Build Mode Selection ---
+            // Build Mode Selection
             ui.horizontal(|ui| {
                 ui.radio_value(&mut self.selected_mode, BuildMode::Debug, "Debug");
                 ui.radio_value(&mut self.selected_mode, BuildMode::Development, "Development");
                 ui.radio_value(&mut self.selected_mode, BuildMode::Shipping, "Shipping");
             });
-
             ui.separator();
 
-            // --- Platform Selection ---
+            // Platform Selection
             ui.horizontal_wrapped(|ui| {
                 ui.radio_value(&mut self.selected_platform, Platform::Win64, "Win64");
                 ui.radio_value(&mut self.selected_platform, Platform::Linux, "Linux");
@@ -153,108 +173,100 @@ impl eframe::App for BuildApp {
                 ui.radio_value(&mut self.selected_platform, Platform::XBoxSeries, "XBoxSeries");
                 ui.radio_value(&mut self.selected_platform, Platform::Switch, "Switch");
             });
+        });
 
-            // Determine if a build/package is running.
-            let running = self.build_progress.is_some();
+        // Compute flags for the bottom panel.
+        let running = self.build_progress.is_some();
+        let package_condition = self.selected_project
+            .map(|index| self.projects[index].engine_version == "From Source")
+            .unwrap_or(false);
 
-            // --- Build & Package Buttons and Progress Display ---
-            ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
-                ui.horizontal(|ui| {
-                    // Build Button: disabled if a process is running.
-                    if ui.add_enabled(!running, egui::Button::new("Build")).clicked() {
-                        if let Some(engine) = &self.engine_location {
-                            if let Some(selected_project_index) = self.selected_project {
-                                let project = &self.projects[selected_project_index];
-                                let platform = match self.selected_platform {
-                                    Platform::Win64 => "Win64",
-                                    Platform::Linux => "Linux",
-                                    Platform::Mac => "Mac",
-                                    Platform::Android => "Android",
-                                    Platform::IOS => "iOS",
-                                    Platform::PS4 => "PS4",
-                                    Platform::PS5 => "PS5",
-                                    Platform::XBoxOne => "XBoxOne",
-                                    Platform::XBoxSeries => "XBoxSeries",
-                                    Platform::Switch => "Switch",
-                                };
-                                let optimization_type = match self.selected_mode {
-                                    BuildMode::Debug => "Debug",
-                                    BuildMode::Development => "Development",
-                                    BuildMode::Shipping => "Shipping",
-                                };
-
-                                // Launch build process and store its progress receiver.
-                                let rx = create_build_command(
-                                    &engine.location,
-                                    &project.name,
-                                    platform,
-                                    optimization_type,
-                                    &project.location,
-                                );
-                                self.progress_rx = Some(rx);
-                                self.build_progress = Some(0.0);
-                                self.progress_message = "Build started...".to_owned();
-                            } else {
-                                eprintln!("No project selected");
-                            }
+        // Bottom panel for Build & Package buttons and the progress bar.
+        egui::TopBottomPanel::bottom("bottom_panel").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                if ui.add_enabled(!running, egui::Button::new("Build")).clicked() {
+                    if let Some(engine) = &self.engine_location {
+                        if let Some(selected_project_index) = self.selected_project {
+                            let project = &self.projects[selected_project_index];
+                            let platform = match self.selected_platform {
+                                Platform::Win64 => "Win64",
+                                Platform::Linux => "Linux",
+                                Platform::Mac => "Mac",
+                                Platform::Android => "Android",
+                                Platform::IOS => "iOS",
+                                Platform::PS4 => "PS4",
+                                Platform::PS5 => "PS5",
+                                Platform::XBoxOne => "XBoxOne",
+                                Platform::XBoxSeries => "XBoxSeries",
+                                Platform::Switch => "Switch",
+                            };
+                            let optimization_type = match self.selected_mode {
+                                BuildMode::Debug => "Debug",
+                                BuildMode::Development => "Development",
+                                BuildMode::Shipping => "Shipping",
+                            };
+                            let rx = create_build_command(
+                                &engine.location,
+                                &project.name,
+                                platform,
+                                optimization_type,
+                                &project.location,
+                            );
+                            self.progress_rx = Some(rx);
+                            self.build_progress = Some(0.0);
+                            self.progress_message = "Build started...".to_owned();
                         } else {
-                            eprintln!("No engine location selected");
+                            eprintln!("No project selected");
                         }
+                    } else {
+                        eprintln!("No engine location selected");
                     }
+                }
 
-                    // Package Button: disabled if a process is running.
-                    let package_condition = self.selected_project
-                        .map(|index| self.projects[index].engine_version == "From Source")
-                        .unwrap_or(false);
-                    if ui
-                        .add_enabled(!running && package_condition, egui::Button::new("Package"))
-                        .clicked()
-                    {
-                        if let Some(engine) = &self.engine_location {
-                            if let Some(selected_project_index) = self.selected_project {
-                                let project = &self.projects[selected_project_index];
-                                let platform = match self.selected_platform {
-                                    Platform::Win64 => "Win64",
-                                    Platform::Linux => "Linux",
-                                    Platform::Mac => "Mac",
-                                    Platform::Android => "Android",
-                                    Platform::IOS => "iOS",
-                                    Platform::PS4 => "PS4",
-                                    Platform::PS5 => "PS5",
-                                    Platform::XBoxOne => "XBoxOne",
-                                    Platform::XBoxSeries => "XBoxSeries",
-                                    Platform::Switch => "Switch",
-                                };
-                                let optimization_type = match self.selected_mode {
-                                    BuildMode::Debug => "Debug",
-                                    BuildMode::Development => "Development",
-                                    BuildMode::Shipping => "Shipping",
-                                };
-                                // Launch package process and store its progress receiver.
-                                let rx = create_package_command(
-                                    &engine.location,
-                                    platform,
-                                    optimization_type,
-                                    &project.location,
-                                );
-                                self.progress_rx = Some(rx);
-                                self.build_progress = Some(0.0);
-                                self.progress_message = "Packaging started...".to_owned();
-                            } else {
-                                eprintln!("No project selected");
-                            }
+                if ui.add_enabled(!running && package_condition, egui::Button::new("Package")).clicked() {
+                    if let Some(engine) = &self.engine_location {
+                        if let Some(selected_project_index) = self.selected_project {
+                            let project = &self.projects[selected_project_index];
+                            let platform = match self.selected_platform {
+                                Platform::Win64 => "Win64",
+                                Platform::Linux => "Linux",
+                                Platform::Mac => "Mac",
+                                Platform::Android => "Android",
+                                Platform::IOS => "iOS",
+                                Platform::PS4 => "PS4",
+                                Platform::PS5 => "PS5",
+                                Platform::XBoxOne => "XBoxOne",
+                                Platform::XBoxSeries => "XBoxSeries",
+                                Platform::Switch => "Switch",
+                            };
+                            let optimization_type = match self.selected_mode {
+                                BuildMode::Debug => "Debug",
+                                BuildMode::Development => "Development",
+                                BuildMode::Shipping => "Shipping",
+                            };
+                            let rx = create_package_command(
+                                &engine.location,
+                                platform,
+                                optimization_type,
+                                &project.location,
+                            );
+                            self.progress_rx = Some(rx);
+                            self.build_progress = Some(0.0);
+                            self.progress_message = "Packaging started...".to_owned();
                         } else {
-                            eprintln!("No engine location selected");
+                            eprintln!("No project selected");
                         }
+                    } else {
+                        eprintln!("No engine location selected");
                     }
-                });
-                // Display the progress bar or status label.
-                if let Some(progress) = self.build_progress {
-                    ui.add(egui::ProgressBar::new(progress).text(&self.progress_message));
-                } else {
-                    ui.label(&self.progress_message);
                 }
             });
+            if let Some(progress) = self.build_progress {
+                ui.add(egui::ProgressBar::new(progress).text(&self.progress_message));
+            } else {
+                ui.label(&self.progress_message);
+            }
         });
+        ctx.request_repaint();
     }
 }
