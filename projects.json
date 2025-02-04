@@ -1,0 +1,19 @@
+[
+  {
+    "name": "spacefrog_blocking",
+    "location": "C:\\Users\\natha\\Perforce\\nmerieux_Blade17_Pitch1_main\\Pitch1_spacefrog\\spacefrog_blocking.uproject",
+    "engine_version": "5.4",
+    "plugins": [
+      "ModelingToolsEditorMode",
+      "ElectronicNodes"
+    ]
+  },
+  {
+    "name": "SourceTest",
+    "location": "D:\\UnrealEngine\\UnrealEngine\\Games\\SourceTest\\SourceTest.uproject",
+    "engine_version": "From Source",
+    "plugins": [
+      "ModelingToolsEditorMode"
+    ]
+  }
+]
